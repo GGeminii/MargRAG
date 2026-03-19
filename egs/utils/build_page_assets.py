@@ -189,7 +189,7 @@ def main() -> None:
     if not wdir.exists():
         raise FileNotFoundError(f"--working-dir {wdir} not found")
 
-    filename = wdir.parent.name if wdir.name == "auto" else wdir.name
+    filename = wdir.parent.name if wdir.name == "hybrid_auto" else wdir.name
 
     middle_json = wdir / f"{filename}_middle.json"
     txt_json = wdir / f"{filename}_content_list.json"

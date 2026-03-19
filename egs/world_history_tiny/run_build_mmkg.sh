@@ -11,8 +11,8 @@ source "${SCRIPT_DIR}/../../env.sh"
 : "${MINERU_PATH:?Set MINERU_PATH in env.sh}"
 
 # If you didn't add MINERU_PATH to PATH in env.sh, ensure the tool exists:
-if [[ ! -x "${MINERU_PATH}/magic-pdf" && ! -f "${MINERU_PATH}/magic-pdf" ]]; then
-  echo "Could not find 'magic-pdf' at ${MINERU_PATH}/magic-pdf"
+if [[ ! -x "${MINERU_PATH}/mineru" && ! -f "${MINERU_PATH}/mineru" ]]; then
+  echo "Could not find 'mineru' at ${MINERU_PATH}/mineru"
   exit 1
 fi
 
@@ -20,12 +20,12 @@ fi
 PDF_PATH="./data/World_History_Volume_1.pdf"
 
 # 1) Parse PDF
-"${MINERU_PATH}/magic-pdf" -p "${PDF_PATH}" -o "./dumps/" -l en -e 9
+"${MINERU_PATH}/mineru" -p "${PDF_PATH}" -o "./dumps/" -l en -e 9
 
 # PDF to Image
 python3 ../utils/pdf2img.py \
     "${PDF_PATH}" \
-    "./dumps/World_History_Volume_1/auto/page_images" \
+    "./dumps/World_History_Volume_1/hybrid_auto/page_images" \
     --dpi 150 \
     --jpeg \
     --end-page 10 \
@@ -33,7 +33,7 @@ python3 ../utils/pdf2img.py \
 
 # Process Input for MegaRAG
 python3 ../utils/build_page_assets.py \
-    --working-dir "./dumps/World_History_Volume_1/auto" \
+    --working-dir "./dumps/World_History_Volume_1/hybrid_auto" \
     --output "./dumps/World_History_Volume_1/pages_content.json"
 
 # 2) Construct MMKG

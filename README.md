@@ -22,14 +22,15 @@
 ### Step 1: Install [MinerU](https://github.com/opendatalab/MinerU/tree/release-1.3.6)
 
 ```bash
-git clone -b release-1.3.6 https://github.com/opendatalab/MinerU.git
+# git clone -b release-1.3.6 https://github.com/opendatalab/MinerU.git
+git clone https://github.com/opendatalab/MinerU.git
 cd MinerU
 
 conda create --name mineru python=3.10 -y
 conda activate mineru
 pip install -e .
 
-pip install huggingface_hub
+pip install huggingface_hub accelerate accelerate
 wget https://raw.githubusercontent.com/opendatalab/MinerU/refs/heads/release-1.3.6/scripts/download_models_hf.py -O download_models_hf.py
 
 sed -i "s|https://github.com/opendatalab/MinerU/raw/master/magic-pdf.template.json|https://raw.githubusercontent.com/opendatalab/MinerU/release-1.3.6/magic-pdf.template.json|" download_models_hf.py

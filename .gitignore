@@ -6,4 +6,5 @@ egs/*/data/
 *.egg-info
 
 env.sh
+lib
 !lib/.gitkeep

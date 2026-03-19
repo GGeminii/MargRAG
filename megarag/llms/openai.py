@@ -1,4 +1,6 @@
 import logging
+import os
+
 import numpy as np
 import mimetypes
 import base64
@@ -22,7 +24,7 @@ from tenacity import (
     wait_exponential,
     retry_if_exception_type,
 )
-from ..lightrag.utils import (
+from lightrag.utils import (
     wrap_embedding_func_with_attrs,
     locate_json_string_body_from_string,
     safe_unicode_decode,
@@ -35,6 +37,9 @@ from lightrag.llm.openai import (
     InvalidResponseError
 )
 from lightrag.types import GPTKeywordExtractionFormat
+
+OPENAI_BASE_URL = os.environ["OPENAI_BASE_URL"]
+OPENAI_MODEL = os.environ["OPENAI_MODEL"]
 
 async def gpt_4o_mini_complete(
     prompt,
@@ -50,7 +55,7 @@ async def gpt_4o_mini_complete(
     if keyword_extraction:
         kwargs["response_format"] = GPTKeywordExtractionFormat
     return await openai_complete_if_cache(
-        "gpt-4o-mini",
+        OPENAI_MODEL,
         prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
@@ -104,6 +109,8 @@ async def openai_complete_if_cache(
     # Pull out and honour any per‑client kwargs
     client_configs = kwargs.pop("openai_client_configs", {})
 
+    if base_url is None:
+        base_url = OPENAI_BASE_URL
     # Instantiate the async client (helper remains unchanged)
     openai_async_client = create_openai_async_client(
         api_key=api_key,
@@ -296,6 +303,8 @@ async def openai_embed(
         APITimeoutError: If the OpenAI API request times out.
     """
     # Create the OpenAI client
+    if base_url is None:
+        base_url = OPENAI_BASE_URL
     openai_async_client = create_openai_async_client(
         api_key=api_key, base_url=base_url, client_configs=client_configs
     )

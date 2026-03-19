@@ -12,7 +12,7 @@ from dataclasses import dataclass, asdict
 if not pm.is_installed("nano-vectordb"):
     pm.install("nano-vectordb")
 
-from  .utils import (
+from lightrag.utils import (
     logger,
     compute_mdhash_id,
 )
