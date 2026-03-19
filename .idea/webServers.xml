@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="7659a4d3-2038-4d3a-b78d-9cb39f20bbba" name="MegaRAG">
+        <fileTransfer accessType="SFTP" host="192.168.0.42" port="22" sshConfigId="70cb890e-fd52-4943-9d44-6fa2ec6edbfd" sshConfig="ubuntu@192.168.0.42:22 agent" authAgent="true" />
+      </webServer>
+    </option>
+  </component>
+</project>
