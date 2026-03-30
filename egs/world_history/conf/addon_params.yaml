@@ -1,5 +1,16 @@
+# 提示词示例参考数量
 example_number: 1
+# 语言
 language: English
+# 实体类型
+#  - 历史时期
+#  - 地理区位
+#  - 文明或帝国
+#  - 历史概念或历史事件
+#  - 历史人物
+#  - 文化或宗教运动
+#  - 史料或文物
+#  - 教材结构
 entity_types:
   - time_period
   - geographical_location
@@ -11,12 +22,19 @@ entity_types:
   - textbook_structure
   
 insert_batch_size: 16
+# 抽取实体最大尝试次数
 entity_extract_max_gleaning: 0
+# 细化实体最大尝试次数
 entity_refine_max_times: 1
 
+# 细化子图配置
+# 最多返回多少条最相关的实体 / 关系
 refine_subgraph_top_k: 120
+# 全局上下文最大 token 数
 refine_subgraph_max_token_for_global_context: 8000
+# 局部子图最大 token 数
 refine_subgraph_max_token_for_local_context: 8000
+# 每个文本分块最多带入多少 token
 refine_subgraph_max_token_for_text_unit: 8000
 
 chunk_top_k: 6
