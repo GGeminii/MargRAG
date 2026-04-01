@@ -1439,17 +1439,17 @@ class MegaRAG(LightRAG):
         返回：
             str | AsyncIterator[str]：方法执行结果；若为 None 表示主要通过副作用完成处理。
         """
-        # 每次查询独立 trace，便于问题追踪与性能分析。
-        # Create a new trace per query to correlate all logs
+        # 每次查询生成独立的追踪ID，便于问题追踪与性能分析
         trace_id_var.set(uuid.uuid4().hex)
 
+        # 进入总查询阶段，记录整体查询耗时与模式
         async with stage("query_total", mode=param.mode or "default"):
-            # 根据 mode 路由到不同查询策略（kg/naive/bypass/two-step）。
-            # If a custom model is provided in param, temporarily update global config
+            # 将当前实例转为字典，获取全局配置
             global_config = asdict(self)
-            # Save original query for vector search
+            # 保存原始用户查询，用于后续向量检索
             param.original_query = query
 
+            # 根据mode路由到知识图谱相关查询流程
             if param.mode in ["local", "global", "hybrid", "mix"]:
                 async with stage("kg_query"):
                     response = await kg_query(
@@ -1464,6 +1464,7 @@ class MegaRAG(LightRAG):
                         system_prompt=system_prompt,
                         chunks_vdb=self.chunks_vdb,
                     )
+            # 朴素检索模式：仅基于文本块向量检索
             elif param.mode == "naive":
                 async with stage("naive_query"):
                     response = await naive_query(
@@ -1475,12 +1476,14 @@ class MegaRAG(LightRAG):
                         hashing_kv=self.llm_response_cache,
                         system_prompt=system_prompt,
                     )
+            # 直通LLM模式：不做知识检索，直接调用大模型
             elif param.mode == "bypass":
-                # Bypass mode: directly use LLM without knowledge retrieval
+                # 使用指定的LLM方法，未指定则使用全局默认方法
                 use_llm_func = param.model_func or global_config["llm_model_func"]
-                # Apply higher priority (8) to entity/relation summary tasks
+                # 为当前LLM调用设置优先级
                 use_llm_func = partial(use_llm_func, _priority=8)
 
+                # 未指定流式输出时，默认开启
                 param.stream = True if param.stream is None else param.stream
                 async with stage("bypass_llm", stream=param.stream):
                     response = await use_llm_func(
@@ -1489,6 +1492,7 @@ class MegaRAG(LightRAG):
                         history_messages=param.conversation_history,
                         stream=param.stream,
                     )
+            # 知识图谱两步查询模式
             elif param.mode == "mix_two_step":
                 async with stage("kg_two_step_query"):
                     response = await kg_two_step_query(
@@ -1503,8 +1507,11 @@ class MegaRAG(LightRAG):
                         system_prompt=system_prompt,
                         chunks_vdb=self.chunks_vdb,
                     )
+            # 未知模式，抛出异常
             else:
                 raise ValueError(f"Unknown mode {param.mode}")
 
+        # 查询完成后执行收尾操作
         await self._query_done()
+        # 返回最终响应结果
         return response

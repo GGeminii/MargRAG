@@ -37,6 +37,7 @@ refine_subgraph_max_token_for_local_context: 8000
 # 每个文本分块最多带入多少 token
 refine_subgraph_max_token_for_text_unit: 8000
 
+# 查询分块top-k
 chunk_top_k: 6
 
 embed_parallel_limit: 12

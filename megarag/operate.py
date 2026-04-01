@@ -679,50 +679,59 @@ async def _build_query_context_for_refine(
 """
     return result
 
+
 async def _build_query_context_with_image(
-    query: str,
-    ll_keywords: str,
-    hl_keywords: str,
-    knowledge_graph_inst: BaseGraphStorage,
-    entities_vdb: BaseVectorStorage,
-    relationships_vdb: BaseVectorStorage,
-    text_chunks_db: BaseKVStorage,
-    query_param: QueryParam,
-    chunks_vdb: BaseVectorStorage = None,
+        query: str,
+        ll_keywords: str,
+        hl_keywords: str,
+        knowledge_graph_inst: BaseGraphStorage,
+        entities_vdb: BaseVectorStorage,
+        relationships_vdb: BaseVectorStorage,
+        text_chunks_db: BaseKVStorage,
+        query_param: QueryParam,
+        chunks_vdb: BaseVectorStorage = None,
 ):
     """
     功能说明：
-        构建包含图像信息的查询上下文，用于多模态问答。
-    
+        构建带多模态（图片）的知识图谱检索上下文，是 KG-RAG 的核心上下文构造函数。
+        根据查询模式（local/global/hybrid/mix）检索实体、关系、文本块、图片，
+        并做 Token 裁剪，最终返回可直接喂给 LLM 的结构化上下文。
+
     参数：
-        - query (str)：用户输入的查询问题。
-        - ll_keywords (str)：方法执行所需输入参数。
-        - hl_keywords (str)：方法执行所需输入参数。
-        - knowledge_graph_inst (BaseGraphStorage)：知识图谱存储实例。
-        - entities_vdb (BaseVectorStorage)：方法执行所需输入参数。
-        - relationships_vdb (BaseVectorStorage)：关系向量存储实例。
-        - text_chunks_db (BaseKVStorage)：方法执行所需输入参数。
-        - query_param (QueryParam)：方法执行所需输入参数。
-        - chunks_vdb (BaseVectorStorage)：方法执行所需输入参数。
-    
+        - query (str)：用户原始问题
+        - ll_keywords (str)：低级实体关键词（用于局部检索、实体检索）
+        - hl_keywords (str)：高级关系关键词（用于全局检索、关系检索）
+        - knowledge_graph_inst (BaseGraphStorage)：知识图谱存储实例
+        - entities_vdb (BaseVectorStorage)：实体向量库
+        - relationships_vdb (BaseVectorStorage)：关系向量库
+        - text_chunks_db (BaseKVStorage)：文本分块键值数据库
+        - query_param (QueryParam)：查询参数
+        - chunks_vdb (BaseVectorStorage)：文本块向量库（mix 模式使用）
+
     返回：
-        Any：方法执行结果；若为 None 表示主要通过副作用完成处理。
+        tuple[str, list]：
+            第一个值：拼接好的完整上下文字符串（实体+关系+文本块+图片）
+            第二个值：图片路径列表，用于多模态 LLM 输入
     """
+    # 打印日志：当前进程开始构建查询上下文
     logger.info(f"Process {os.getpid()} building query context...")
 
-    # 与 refine 版本类似，但额外汇总页图信息用于多模态输入。
-    # Collect all chunks from different sources
+    # 与精修流程逻辑类似，但额外汇总页面图片用于多模态输入
+    # 收集所有来源的文本块（实体来源、关系来源、向量来源）
     all_chunks = []
+    # 实体上下文列表
     entities_context = []
+    # 关系上下文列表
     relations_context = []
+    # 页面图片路径列表（多模态）
     page_imgs = []
 
-    # Store original data for later text chunk retrieval
+    # 保存原始实体与关系数据，用于后续反向查找文本块
     original_node_datas = []
     original_edge_datas = []
 
-    # 按模式路由图谱检索来源。
-    # Handle local and global modes
+    # 根据查询模式（local/global/hybrid/mix）执行不同的图谱检索策略
+    # 处理局部模式（local）：专注检索【实体】
     if query_param.mode == "local":
         (
             entities_context,
@@ -730,14 +739,16 @@ async def _build_query_context_with_image(
             node_datas,
             use_relations,
         ) = await _get_node_data(
-            ll_keywords,
-            knowledge_graph_inst,
-            entities_vdb,
-            query_param,
+            ll_keywords,  # 低级关键词
+            knowledge_graph_inst,  # 图谱实例
+            entities_vdb,  # 实体向量库
+            query_param,  # 查询参数
         )
+        # 保存原始实体与关系
         original_node_datas = node_datas
         original_edge_datas = use_relations
 
+    # 处理全局模式（global）：专注检索【关系】
     elif query_param.mode == "global":
         (
             entities_context,
@@ -745,21 +756,25 @@ async def _build_query_context_with_image(
             edge_datas,
             use_entities,
         ) = await _get_edge_data(
-            hl_keywords,
-            knowledge_graph_inst,
-            relationships_vdb,
-            query_param,
+            hl_keywords,  # 高级关键词
+            knowledge_graph_inst,  # 图谱实例
+            relationships_vdb,  # 关系向量库
+            query_param,  # 查询参数
         )
+        # 保存原始关系与实体
         original_edge_datas = edge_datas
         original_node_datas = use_entities
 
-    else:  # hybrid or mix mode
+    # 混合模式（hybrid / mix）：同时检索实体 + 关系
+    else:
+        # 并行执行实体检索
         ll_data = await _get_node_data(
             ll_keywords,
             knowledge_graph_inst,
             entities_vdb,
             query_param,
         )
+        # 并行执行关系检索
         hl_data = await _get_edge_data(
             hl_keywords,
             knowledge_graph_inst,
@@ -767,50 +782,58 @@ async def _build_query_context_with_image(
             query_param,
         )
 
+        # 拆解局部（实体）检索结果
         (ll_entities_context, ll_relations_context, ll_node_datas, ll_edge_datas) = (
             ll_data
         )
+        # 拆解全局（关系）检索结果
         (hl_entities_context, hl_relations_context, hl_edge_datas, hl_node_datas) = (
             hl_data
         )
 
-        # mix 模式先做向量召回，并从 text_chunks 反查 page_img。
-        # Get vector chunks first if in mix mode
+        # mix 模式：额外做向量检索，并从文本块中提取图片
         if query_param.mode == "mix" and chunks_vdb:
+            # 从向量库检索相关文本块
             vector_chunks = await _get_vector_context(
                 query,
                 chunks_vdb,
                 query_param,
             )
+            # 提取 chunk_id
             chunk_ids = [d['id'] for d in vector_chunks]
-            chunks    = await text_chunks_db.get_by_ids(chunk_ids)
+            # 从数据库获取完整分块
+            chunks = await text_chunks_db.get_by_ids(chunk_ids)
+            # 如果分块包含图片，提取图片路径
             if 'page_img' in chunks[0]:
                 page_imgs = [chunk['page_img'] for chunk in chunks]
-                # for i, chunk in enumerate(vector_chunks):
-                #     chunk['page_img'] = page_imgs[i]
+
+            # 将向量检索的块加入总块列表
             all_chunks.extend(vector_chunks)
-            
-        # Store original data from both sources
+
+        # 合并两种检索方式的原始数据
         original_node_datas = ll_node_datas + hl_node_datas
         original_edge_datas = ll_edge_datas + hl_edge_datas
 
-        # Combine entities and relations contexts
+        # 合并实体上下文（去重、合并）
         entities_context = process_combine_contexts(
             ll_entities_context, hl_entities_context
         )
+        # 合并关系上下文
         relations_context = process_combine_contexts(
             hl_relations_context, ll_relations_context
         )
 
+    # 打印初始检索到的数量日志
     logger.info(
         f"Initial context: {len(entities_context)} entities, {len(relations_context)} relations, {len(all_chunks)} chunks"
     )
 
-    # 统一 token 控制，先压缩实体/关系上下文。
-    # Unified token control system - Apply precise token limits to entities and relations
+    # ====================== 统一 Token 长度控制 ======================
+    # 获取分词器，用于裁剪超长上下文
     tokenizer = text_chunks_db.global_config.get("tokenizer")
     if tokenizer:
-        # Get new token limits from query_param (with fallback to global_config)
+        # 从查询参数/全局配置获取最大 Token 限制
+        # 实体最大 Token
         max_entity_tokens = getattr(
             query_param,
             "max_entity_tokens",
@@ -818,6 +841,7 @@ async def _build_query_context_with_image(
                 "max_entity_tokens", DEFAULT_MAX_ENTITY_TOKENS
             ),
         )
+        # 关系最大 Token
         max_relation_tokens = getattr(
             query_param,
             "max_relation_tokens",
@@ -825,6 +849,7 @@ async def _build_query_context_with_image(
                 "max_relation_tokens", DEFAULT_MAX_RELATION_TOKENS
             ),
         )
+        # 总上下文最大 Token
         max_total_tokens = getattr(
             query_param,
             "max_total_tokens",
@@ -833,69 +858,77 @@ async def _build_query_context_with_image(
             ),
         )
 
-        # Truncate entities based on complete JSON serialization
+        # 如果有实体上下文，清理格式并按 Token 裁剪
         if entities_context:
             original_entity_count = len(entities_context)
 
-            # Process entities context to replace GRAPH_FIELD_SEP with : in file_path fields
+            # 替换文件路径中的分隔符，避免解析异常
             for entity in entities_context:
                 if "file_path" in entity and entity["file_path"]:
                     entity["file_path"] = entity["file_path"].replace(
                         GRAPH_FIELD_SEP, ";"
                     )
 
+            # 按 Token 长度裁剪实体列表
             entities_context = truncate_list_by_token_size(
                 entities_context,
                 key=lambda x: json.dumps(x, ensure_ascii=False),
                 max_token_size=max_entity_tokens,
                 tokenizer=tokenizer,
             )
+            # 打印裁剪日志
             if len(entities_context) < original_entity_count:
                 logger.debug(
                     f"Truncated entities: {original_entity_count} -> {len(entities_context)} (entity max tokens: {max_entity_tokens})"
                 )
 
-        # Truncate relations based on complete JSON serialization
+        # 如果有关系上下文，清理格式并按 Token 裁剪
         if relations_context:
             original_relation_count = len(relations_context)
 
-            # Process relations context to replace GRAPH_FIELD_SEP with : in file_path fields
+            # 替换路径分隔符
             for relation in relations_context:
                 if "file_path" in relation and relation["file_path"]:
                     relation["file_path"] = relation["file_path"].replace(
                         GRAPH_FIELD_SEP, ";"
                     )
 
+            # 按 Token 长度裁剪关系列表
             relations_context = truncate_list_by_token_size(
                 relations_context,
                 key=lambda x: json.dumps(x, ensure_ascii=False),
                 max_token_size=max_relation_tokens,
                 tokenizer=tokenizer,
             )
+            # 打印裁剪日志
             if len(relations_context) < original_relation_count:
                 logger.debug(
                     f"Truncated relations: {original_relation_count} -> {len(relations_context)} (relation max tokens: {max_relation_tokens})"
                 )
 
-    # 根据最终实体/关系映射回 node/edge，再检索关联文本。
-    # After truncation, get text chunks based on final entities and relations
+    # ====================== 根据裁剪后的实体/关系，反向查找关联文本块 ======================
     logger.info("Getting text chunks based on truncated entities and relations...")
 
-    # Create filtered data based on truncated context
+    # 筛选出裁剪后最终保留的实体数据
     final_node_datas = []
     if entities_context and original_node_datas:
+        # 提取最终实体名称集合
         final_entity_names = {e["entity"] for e in entities_context}
         seen_nodes = set()
+        # 从原始数据中过滤出保留的实体
         for node in original_node_datas:
             name = node.get("entity_name")
             if name in final_entity_names and name not in seen_nodes:
                 final_node_datas.append(node)
                 seen_nodes.add(name)
 
+    # 筛选出裁剪后最终保留的关系数据
     final_edge_datas = []
     if relations_context and original_edge_datas:
+        # 提取最终关系对 (实体1, 实体2)
         final_relation_pairs = {(r["entity1"], r["entity2"]) for r in relations_context}
         seen_edges = set()
+        # 从原始数据中过滤出保留的关系
         for edge in original_edge_datas:
             src, tgt = edge.get("src_id"), edge.get("tgt_id")
             if src is None or tgt is None:
@@ -906,9 +939,10 @@ async def _build_query_context_with_image(
                 final_edge_datas.append(edge)
                 seen_edges.add(pair)
 
-    # Get text chunks based on final filtered data
+    # 并行任务：从实体/关系反向查找关联文本块
     text_chunk_tasks = []
 
+    # 从实体找文本块
     if final_node_datas:
         text_chunk_tasks.append(
             _find_most_related_text_unit_from_entities(
@@ -919,6 +953,7 @@ async def _build_query_context_with_image(
             )
         )
 
+    # 从关系找文本块
     if final_edge_datas:
         text_chunk_tasks.append(
             _find_related_text_unit_from_relationships(
@@ -928,19 +963,17 @@ async def _build_query_context_with_image(
             )
         )
 
-    # 并行拉取实体相关文本与关系相关文本。
-    # Execute text chunk retrieval in parallel
+    # 并行执行，提高速度
     if text_chunk_tasks:
         text_chunk_results = await asyncio.gather(*text_chunk_tasks)
         for chunks in text_chunk_results:
             if chunks:
                 all_chunks.extend(chunks)
 
-    # 基于动态预算裁剪 chunks，构建最终 DC 上下文。
-    # Apply token processing to chunks if tokenizer is available
+    # 对文本块进行动态 Token 预算裁剪，构建最终上下文
     text_units_context = []
     if tokenizer and all_chunks:
-        # Calculate dynamic token limit for text chunks
+        # 计算已用 Token：实体 + 关系
         entities_str = json.dumps(entities_context, ensure_ascii=False)
         relations_str = json.dumps(relations_context, ensure_ascii=False)
 
@@ -964,103 +997,116 @@ async def _build_query_context_with_image(
 ```
 
 """
+        # 使用模板格式化知识图谱上下文，将实体和关系序列化为字符串填入模板
         kg_context = kg_context_template.format(
             entities_str=entities_str, relations_str=relations_str
         )
+        # 计算知识图谱上下文占用的token数量
         kg_context_tokens = len(tokenizer.encode(kg_context))
 
-        # Calculate actual system prompt overhead dynamically
-        # 1. Calculate conversation history tokens
+        # 动态计算实际系统提示词的固定开销（不包含文本块上下文）
+        # 1. 计算对话历史占用的token数
         history_context = ""
         if query_param.conversation_history:
+            # 从对话历史中提取指定轮数的内容
             history_context = get_conversation_turns(
                 query_param.conversation_history, query_param.history_turns
             )
+        # 计算历史对话的token长度，无历史则为0
         history_tokens = (
             len(tokenizer.encode(history_context)) if history_context else 0
         )
 
-        # 2. Calculate system prompt template tokens (excluding context_data)
+        # 2. 计算系统提示词模板本身的token开销（不包含动态上下文内容）
+        # 获取用户自定义提示词，无则使用空字符串
         user_prompt = query_param.user_prompt if query_param.user_prompt else ""
+        # 获取回答格式类型，无则默认多段落格式
         response_type = (
             query_param.response_type
             if query_param.response_type
             else "Multiple Paragraphs"
         )
 
-        # Get the system prompt template from PROMPTS
+        # 从全局配置获取系统提示词模板，无配置则使用默认的RAG提示词模板
         sys_prompt_template = text_chunks_db.global_config.get(
             "system_prompt_template", PROMPTS["rag_response"]
         )
 
-        # Create a sample system prompt with placeholders filled (excluding context_data)
+        # 构造一个空上下文的示例提示词，专门用于计算固定开销的token长度
         sample_sys_prompt = sys_prompt_template.format(
-            history=history_context,
-            context_data="",  # Empty for overhead calculation
-            response_type=response_type,
-            user_prompt=user_prompt,
+            history=history_context,  # 填入历史对话
+            context_data="",  # 上下文内容置空，仅计算模板开销
+            response_type=response_type,  # 填入回答格式要求
+            user_prompt=user_prompt,  # 填入用户自定义提示词
         )
+        # 计算系统提示词模板的固定token开销
         sys_prompt_template_tokens = len(tokenizer.encode(sample_sys_prompt))
 
-        # Total system prompt overhead = template + query tokens
-        query_tokens = len(tokenizer.encode(query))
+        # 系统提示词总固定开销 = 模板本身token + 用户问题token
+        query_tokens = len(tokenizer.encode(query))  # 计算用户问题的token长度
         sys_prompt_overhead = sys_prompt_template_tokens + query_tokens
 
-        buffer_tokens = 100  # Safety buffer as requested
+        # 安全缓冲token：预留100个token防止总长度超出模型上限
+        buffer_tokens = 100
 
-        # Calculate available tokens for text chunks
+        # 计算可分配给【文本块】的剩余token数量
+        # 已用token = 图谱上下文 + 提示词固定开销 + 安全缓冲
         used_tokens = kg_context_tokens + sys_prompt_overhead + buffer_tokens
+        # 可用文本块token = 模型最大允许token - 已用token
         available_chunk_tokens = max_total_tokens - used_tokens
 
+        # 打印token分配明细日志，便于调试
         logger.debug(
             f"Token allocation - Total: {max_total_tokens}, History: {history_tokens}, SysPrompt: {sys_prompt_overhead}, KG: {kg_context_tokens}, Buffer: {buffer_tokens}, Available for chunks: {available_chunk_tokens}"
         )
 
-        # Re-process chunks with dynamic token limit
+        # 使用动态计算的token限制，重新处理文本块
         if all_chunks:
-            # Create a temporary query_param copy with adjusted chunk token limit
+            # 构造临时文本块列表，仅保留内容和文件路径字段
             temp_chunks = [
                 {"content": chunk["content"], "file_path": chunk["file_path"]}
                 for chunk in all_chunks
             ]
 
-            # Apply token truncation to chunks using the dynamic limit
+            # 调用统一分块处理函数，按动态可用token长度裁剪文本块
             truncated_chunks = await process_chunks_unified(
                 query=query,
                 chunks=temp_chunks,
                 query_param=query_param,
                 global_config=text_chunks_db.global_config,
-                source_type="mixed",
-                chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
+                source_type="mixed",  # 数据源类型：混合来源（实体+关系+向量）
+                chunk_token_limit=available_chunk_tokens,  # 传入动态计算的可用token上限
             )
 
-            # Rebuild text_units_context with truncated chunks
+            # 使用裁剪后的文本块，重新构建最终的文本单元上下文
             for i, chunk in enumerate(truncated_chunks):
                 text_units_context.append(
                     {
-                        "id": i + 1,
-                        "content": chunk["content"],
-                        "file_path": chunk.get("file_path", "unknown_source"),
+                        "id": i + 1,  # 文本块序号
+                        "content": chunk["content"],  # 文本块内容
+                        "file_path": chunk.get("file_path", "unknown_source"),  # 来源文件路径
                     }
                 )
 
+            # 打印文本块裁剪日志
             logger.debug(
                 f"Re-truncated chunks for dynamic token limit: {len(temp_chunks)} -> {len(text_units_context)} (chunk available tokens: {available_chunk_tokens})"
             )
 
+    # 打印最终构建完成的上下文统计信息
     logger.info(
         f"Final context: {len(entities_context)} entities, {len(relations_context)} relations, {len(text_units_context)} chunks"
     )
-
-    # not necessary to use LLM to generate a response
+    # 关键判断：如果既没有实体也没有关系，说明无有效参考信息，无法生成回答
     if not entities_context and not relations_context:
         return None
-
+    # 将最终的实体、关系、文本块上下文序列化为JSON字符串
     entities_str = json.dumps(entities_context, ensure_ascii=False)
     relations_str = json.dumps(relations_context, ensure_ascii=False)
     text_units_str = json.dumps(text_units_context, ensure_ascii=False)
-    page_imgs_str = json.dumps({f"image_{i}": f"filename:{p.split('/')[-1]}" for i, p in enumerate(page_imgs)}, ensure_ascii=False)
-
+    # 构建图片信息JSON：将图片路径转为多模态模型可识别的格式
+    page_imgs_str = json.dumps({f"image_{i}": f"filename:{p.split('/')[-1]}" for i, p in enumerate(page_imgs)},
+                                   ensure_ascii=False)
     result = f"""-----Entities(KG)-----
 
 ```json
@@ -2162,30 +2208,31 @@ async def naive_query(
 ) -> str | AsyncIterator[str]:
     """
     功能说明：
-        执行基础检索问答流程（不依赖复杂图推理）。
-    
+        执行基础检索问答流程（朴素RAG，不依赖复杂图推理），仅通过向量检索文本块生成回答。
+        核心流程：缓存检查 → 向量检索 → 上下文截断 → 提示词组装 → LLM生成 → 结果缓存。
+
     参数：
-        - query (str)：用户输入的查询问题。
-        - chunks_vdb (BaseVectorStorage)：方法执行所需输入参数。
-        - text_chunks_db (BaseKVStorage)：方法执行所需输入参数。
-        - query_param (QueryParam)：方法执行所需输入参数。
-        - global_config (dict[str, str])：全局运行配置字典。
-        - hashing_kv (BaseKVStorage | None)：方法执行所需输入参数。
-        - system_prompt (str | None)：方法执行所需输入参数。
-    
+        - query (str)：用户输入的查询问题
+        - chunks_vdb (BaseVectorStorage)：文本分块向量数据库，用于相似度检索
+        - text_chunks_db (BaseKVStorage)：文本分块键值存储，用于根据ID获取完整分块内容
+        - query_param (QueryParam)：查询参数对象，包含模型、流式、重排、上下文条数等配置
+        - global_config (dict[str, str])：全局运行配置字典，包含分词器、最大token数、默认模型等
+        - hashing_kv (BaseKVStorage | None)：LLM问答缓存存储实例，用于缓存重复查询结果
+        - system_prompt (str | None)：自定义系统提示词，不传入则使用默认提示词
+
     返回：
-        str | AsyncIterator[str]：方法执行结果；若为 None 表示主要通过副作用完成处理。
+        str | AsyncIterator[str]：返回最终回答字符串；若开启流式返回，则返回异步迭代器
     """
-    # 选择模型函数（优先 query_param 覆盖），并提升查询优先级。
+    # 选择模型函数：优先使用查询参数中指定的模型，否则使用全局配置的模型，并设置查询优先级为5
     if query_param.model_func:
         use_model_func = query_param.model_func
     else:
         use_model_func = global_config["llm_model_func"]
-        # Apply higher priority (5) to query relation LLM function
+        # 为查询相关的LLM函数应用更高优先级(5)
         use_model_func = partial(use_model_func, _priority=5)
 
-    # 先查缓存，命中直接返回，降低重复查询成本。
-    # Handle cache
+    # 先查询缓存，若命中直接返回，降低重复查询的性能开销
+    # 处理缓存逻辑
     args_hash = compute_args_hash(query_param.mode, query)
     cached_response, quantized, min_val, max_val = await handle_cache(
         hashing_kv, args_hash, query, query_param.mode, cache_type="query"
@@ -2193,23 +2240,26 @@ async def naive_query(
     if cached_response is not None:
         return cached_response
 
+    # 获取全局分词器，用于计算token数量
     tokenizer: Tokenizer = global_config["tokenizer"]
 
+    # 从向量数据库中检索与查询问题相关的文本分块
     chunks = await _get_vector_context(query, chunks_vdb, query_param)
 
+    # 未检索到任何分块，直接返回预设的失败响应
     if chunks is None or len(chunks) == 0:
         return PROMPTS["fail_response"]
 
-    # 动态计算 chunk 可用 token，避免提示词超长。
-    # Calculate dynamic token limit for chunks
-    # Get token limits from query_param (with fallback to global_config)
+    # 动态计算分块可用token数量，避免提示词总长度超出模型限制
+    # 计算分块动态token限制
+    # 从查询参数获取最大总token数，无则使用全局配置默认值
     max_total_tokens = getattr(
         query_param,
         "max_total_tokens",
         global_config.get("max_total_tokens", DEFAULT_MAX_TOTAL_TOKENS),
     )
 
-    # Calculate conversation history tokens
+    # 计算对话历史占用的token数
     history_context = ""
     if query_param.conversation_history:
         history_context = get_conversation_turns(
@@ -2217,7 +2267,7 @@ async def naive_query(
         )
     history_tokens = len(tokenizer.encode(history_context)) if history_context else 0
 
-    # Calculate system prompt template tokens (excluding content_data)
+    # 计算系统提示词模板（不含上下文内容）的token数
     user_prompt = query_param.user_prompt if query_param.user_prompt else ""
     response_type = (
         query_param.response_type
@@ -2225,49 +2275,51 @@ async def naive_query(
         else "Multiple Paragraphs"
     )
 
-    # Use the provided system prompt or default
+    # 使用传入的系统提示词或默认提示词模板
     sys_prompt_template = (
         system_prompt if system_prompt else PROMPTS["naive_rag_response"]
     )
 
-    # Create a sample system prompt with empty content_data to calculate overhead
+    # 创建空内容的示例系统提示词，用于计算固定开销token
     sample_sys_prompt = sys_prompt_template.format(
-        content_data="",  # Empty for overhead calculation
+        content_data="",  # 空内容用于计算开销
         response_type=response_type,
         history=history_context,
         user_prompt=user_prompt,
     )
     sys_prompt_template_tokens = len(tokenizer.encode(sample_sys_prompt))
 
-    # Total system prompt overhead = template + query tokens
+    # 系统提示词总开销 = 模板token + ·
     query_tokens = len(tokenizer.encode(query))
     sys_prompt_overhead = sys_prompt_template_tokens + query_tokens
 
-    buffer_tokens = 100  # Safety buffer
+    # 安全缓冲token，防止溢出
+    buffer_tokens = 100
 
-    # Calculate available tokens for chunks
+    # 计算可分配给文本分块的token数量
     used_tokens = sys_prompt_overhead + buffer_tokens
     available_chunk_tokens = max_total_tokens - used_tokens
 
+    # 打印token分配日志，便于调试
     logger.debug(
         f"Naive query token allocation - Total: {max_total_tokens}, History: {history_tokens}, SysPrompt: {sys_prompt_overhead}, Buffer: {buffer_tokens}, Available for chunks: {available_chunk_tokens}"
     )
 
-    # 统一 chunk 处理（重排/截断），得到最终上下文片段。
-    # Process chunks using unified processing with dynamic token limit
+    # 统一处理分块：重排序、截断，得到符合token限制的最终上下文片段
+    # 使用统一处理函数处理分块，传入动态计算的token限制
     processed_chunks = await process_chunks_unified(
         query=query,
         chunks=chunks,
         query_param=query_param,
         global_config=global_config,
         source_type="vector",
-        chunk_token_limit=available_chunk_tokens,  # Pass dynamic limit
+        chunk_token_limit=available_chunk_tokens,  # 传入动态限制值
     )
 
     logger.info(f"Final context: {len(processed_chunks)} chunks")
 
-    # 组织 DC 上下文，并按需补充 page image 引用。
-    # Build text_units_context from processed chunks
+    # 构建上下文内容，组织分块信息，并补充分页图片引用（多模态场景）
+    # 从处理后的分块构建文本单元上下文
     text_units_context, chunk_ids = [], []
     for i, chunk in enumerate(processed_chunks):
         text_units_context.append(
@@ -2278,12 +2330,15 @@ async def naive_query(
             }
         )
         chunk_ids.append(chunk['id'])
+    # 根据分块ID从数据库获取完整信息
     chunks = await text_chunks_db.get_by_ids(chunk_ids)
     page_imgs_str = ""
+    # 提取分块中的图片信息，用于多模态问答
     if 'page_img' in chunks[0]:
         page_imgs = [chunk['page_img'] for chunk in chunks]
         page_imgs_str = json.dumps({f"image_{i}": f"filename:{p.split('/')[-1]}" for i, p in enumerate(page_imgs)}, ensure_ascii=False)
 
+    # 将上下文信息序列化为JSON字符串
     text_units_str = json.dumps(text_units_context, ensure_ascii=False)
     context = f"""
 ---Document Chunks---
@@ -2297,18 +2352,18 @@ async def naive_query(
 {page_imgs_str}
 ```
 """
-    
+    # 如果用户只需要获取上下文内容，直接返回拼接好的上下文
     if query_param.only_need_context:
         return context
-    # Process conversation history
+    # 重新处理对话历史（兼容上层逻辑，确保历史正确加载）
     history_context = ""
     if query_param.conversation_history:
         history_context = get_conversation_turns(
             query_param.conversation_history, query_param.history_turns
         )
 
-    # 组装系统提示词（包含历史对话、上下文、用户补充要求）。
-    # Build system prompt
+    # 组装最终系统提示词（包含上下文、历史对话、用户自定义要求）
+    # 构建系统提示词
     user_prompt = (
         query_param.user_prompt
         if query_param.user_prompt
@@ -2321,16 +2376,18 @@ async def naive_query(
         history=history_context,
         user_prompt=user_prompt,
     )
-    
+
+    # 如果用户只需要生成提示词，不进行LLM调用，直接返回提示词
     if query_param.only_need_prompt:
         return sys_prompt
 
+    # 计算本次发送给LLM的总token数，用于日志调试
     len_of_prompts = len(tokenizer.encode(query + sys_prompt))
     logger.debug(
         f"[naive_query] Sending to LLM: {len_of_prompts:,} tokens (Query: {len(tokenizer.encode(query))}, System: {len(tokenizer.encode(sys_prompt))})"
     )
 
-    # 发起最终生成请求；多模态时携带 page_imgs。
+    # 调用LLM模型生成回答，支持流式输出与多模态图片输入
     response = await use_model_func(
         query,
         input_images=page_imgs,
@@ -2338,9 +2395,10 @@ async def naive_query(
         stream=query_param.stream,
     )
 
+    # 对返回的字符串结果做清洗：去除提示词、角色标记、用户问题等冗余内容
     if isinstance(response, str) and len(response) > len(sys_prompt):
         response = (
-            response[len(sys_prompt) :]
+            response[len(sys_prompt):]
             .replace(sys_prompt, "")
             .replace("user", "")
             .replace("model", "")
@@ -2350,9 +2408,9 @@ async def naive_query(
             .strip()
         )
 
-    # 若开启缓存，将本次回答写入 query cache。
+    # 如果全局开启了LLM缓存，将本次问答结果存入缓存
     if hashing_kv.global_config.get("enable_llm_cache"):
-        # Save to cache
+        # 保存结果到缓存
         await save_to_cache(
             hashing_kv,
             CacheData(
@@ -2367,49 +2425,51 @@ async def naive_query(
             ),
         )
 
+    # 返回最终生成的回答（字符串或异步迭代器）
     return response
 
+
 async def kg_query(
-    query: str,
-    knowledge_graph_inst: BaseGraphStorage,
-    entities_vdb: BaseVectorStorage,
-    relationships_vdb: BaseVectorStorage,
-    text_chunks_db: BaseKVStorage,
-    query_param: QueryParam,
-    global_config: dict[str, str],
-    hashing_kv: BaseKVStorage | None = None,
-    system_prompt: str | None = None,
-    chunks_vdb: BaseVectorStorage = None,
+        query: str,
+        knowledge_graph_inst: BaseGraphStorage,
+        entities_vdb: BaseVectorStorage,
+        relationships_vdb: BaseVectorStorage,
+        text_chunks_db: BaseKVStorage,
+        query_param: QueryParam,
+        global_config: dict[str, str],
+        hashing_kv: BaseKVStorage | None = None,
+        system_prompt: str | None = None,
+        chunks_vdb: BaseVectorStorage = None,
 ) -> str | AsyncIterator[str]:
     """
     功能说明：
         执行知识图谱增强查询流程，综合实体关系进行回答。
-    
+
     参数：
         - query (str)：用户输入的查询问题。
         - knowledge_graph_inst (BaseGraphStorage)：知识图谱存储实例。
-        - entities_vdb (BaseVectorStorage)：方法执行所需输入参数。
+        - entities_vdb (BaseVectorStorage)：实体向量数据库实例。
         - relationships_vdb (BaseVectorStorage)：关系向量存储实例。
-        - text_chunks_db (BaseKVStorage)：方法执行所需输入参数。
-        - query_param (QueryParam)：方法执行所需输入参数。
+        - text_chunks_db (BaseKVStorage)：文本分块键值存储实例。
+        - query_param (QueryParam)：查询参数对象。
         - global_config (dict[str, str])：全局运行配置字典。
-        - hashing_kv (BaseKVStorage | None)：方法执行所需输入参数。
-        - system_prompt (str | None)：方法执行所需输入参数。
-        - chunks_vdb (BaseVectorStorage)：方法执行所需输入参数。
-    
+        - hashing_kv (BaseKVStorage | None)：LLM缓存存储实例。
+        - system_prompt (str | None)：自定义系统提示词。
+        - chunks_vdb (BaseVectorStorage)：文本分块向量库（混合模式使用）。
+
     返回：
-        str | AsyncIterator[str]：方法执行结果；若为 None 表示主要通过副作用完成处理。
+        str | AsyncIterator[str]：返回回答字符串或流式迭代器。
     """
-    # 知识图谱查询入口：关键词提取 -> 上下文构建 -> LLM 生成。
+    # 选择LLM模型函数：优先查询参数，其次全局配置，提升优先级为5
     if query_param.model_func:
         use_model_func = query_param.model_func
     else:
         use_model_func = global_config["llm_model_func"]
-        # Apply higher priority (5) to query relation LLM function
+        # 为查询相关的LLM函数应用更高优先级(5)
         use_model_func = partial(use_model_func, _priority=5)
 
-    # 优先查询缓存，避免重复图检索与生成。
-    # Handle cache
+    # 检查缓存，命中则直接返回缓存结果
+    # 处理缓存
     args_hash = compute_args_hash(query_param.mode, query)
     cached_response, quantized, min_val, max_val = await handle_cache(
         hashing_kv, args_hash, query, query_param.mode, cache_type="query"
@@ -2417,15 +2477,17 @@ async def kg_query(
     if cached_response is not None:
         return cached_response
 
+    # 从用户问题中抽取高低优先级关键词，用于知识图谱检索
     hl_keywords, ll_keywords = await get_keywords_from_query(
         query, query_param, global_config, hashing_kv
     )
 
+    # 打印关键词日志，便于调试
     logger.debug(f"High-level keywords: {hl_keywords}")
     logger.debug(f"Low-level  keywords: {ll_keywords}")
 
-    # 关键词缺失时按规则降级模式（hybrid->local/global）。
-    # Handle empty keywords
+    # 关键词缺失时自动降级查询模式，保证流程可用
+    # 处理关键词为空的异常情况
     if hl_keywords == [] and ll_keywords == []:
         logger.warning("low_level_keywords and high_level_keywords is empty")
         return PROMPTS["fail_response"]
@@ -2442,11 +2504,12 @@ async def kg_query(
         )
         query_param.mode = "local"
 
+    # 将关键词列表转为逗号分隔字符串
     ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
     hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
 
-    # 构建含实体/关系/文本块（及图像引用）的综合上下文。
-    # Build context
+    # 构建包含实体、关系、文本块、图片的综合上下文
+    # 构建查询上下文（含图片）
     context, page_imgs = await _build_query_context_with_image(
         query,
         ll_keywords_str,
@@ -2459,19 +2522,21 @@ async def kg_query(
         chunks_vdb,
     )
 
+    # 如果只需要上下文，直接返回上下文
     if query_param.only_need_context:
         return context if context is not None else PROMPTS["fail_response"]
+    # 上下文为空，返回失败响应
     if context is None:
         return PROMPTS["fail_response"]
 
-    # Process conversation history
+    # 处理对话历史
     history_context = ""
     if query_param.conversation_history:
         history_context = get_conversation_turns(
             query_param.conversation_history, query_param.history_turns
         )
 
-    # Build system prompt
+    # 构建系统提示词
     user_prompt = (
         query_param.user_prompt
         if query_param.user_prompt
@@ -2485,20 +2550,24 @@ async def kg_query(
         user_prompt=user_prompt,
     )
 
+    # 如果只需要提示词，直接返回提示词
     if query_param.only_need_prompt:
         return sys_prompt
 
+    # 计算提示词token数并打印调试日志
     tokenizer: Tokenizer = global_config["tokenizer"]
     len_of_prompts = len(tokenizer.encode(query + sys_prompt))
     logger.debug(
         f"[kg_query] Sending to LLM: {len_of_prompts:,} tokens (Query: {len(tokenizer.encode(query))}, System: {len(tokenizer.encode(sys_prompt))})"
     )
+    # 调用LLM生成回答
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
         stream=query_param.stream,
         input_images=page_imgs,
     )
+    # 清洗返回结果，去除冗余内容
     if isinstance(response, str) and len(response) > len(sys_prompt):
         response = (
             response.replace(sys_prompt, "")
@@ -2510,8 +2579,9 @@ async def kg_query(
             .strip()
         )
 
+    # 开启缓存则写入缓存
     if hashing_kv.global_config.get("enable_llm_cache"):
-        # Save to cache
+        # 保存到缓存
         await save_to_cache(
             hashing_kv,
             CacheData(
@@ -2526,46 +2596,49 @@ async def kg_query(
             ),
         )
 
+    # 返回最终回答
     return response
 
+
 async def kg_two_step_query(
-    query: str,
-    knowledge_graph_inst: BaseGraphStorage,
-    entities_vdb: BaseVectorStorage,
-    relationships_vdb: BaseVectorStorage,
-    text_chunks_db: BaseKVStorage,
-    query_param: QueryParam,
-    global_config: dict[str, str],
-    hashing_kv: BaseKVStorage | None = None,
-    system_prompt: str | None = None,
-    chunks_vdb: BaseVectorStorage = None,
+        query: str,
+        knowledge_graph_inst: BaseGraphStorage,
+        entities_vdb: BaseVectorStorage,
+        relationships_vdb: BaseVectorStorage,
+        text_chunks_db: BaseKVStorage,
+        query_param: QueryParam,
+        global_config: dict[str, str],
+        hashing_kv: BaseKVStorage | None = None,
+        system_prompt: str | None = None,
+        chunks_vdb: BaseVectorStorage = None,
 ) -> str | AsyncIterator[str]:
     """
     功能说明：
-        执行两阶段图谱查询，先检索后推理生成最终答案。
-    
+        执行两阶段图谱查询，先并行检索图谱+朴素向量结果，再融合生成最终答案。
+
     参数：
         - query (str)：用户输入的查询问题。
         - knowledge_graph_inst (BaseGraphStorage)：知识图谱存储实例。
-        - entities_vdb (BaseVectorStorage)：方法执行所需输入参数。
-        - relationships_vdb (BaseVectorStorage)：关系向量存储实例。
-        - text_chunks_db (BaseKVStorage)：方法执行所需输入参数。
-        - query_param (QueryParam)：方法执行所需输入参数。
-        - global_config (dict[str, str])：全局运行配置字典。
-        - hashing_kv (BaseKVStorage | None)：方法执行所需输入参数。
-        - system_prompt (str | None)：方法执行所需输入参数。
-        - chunks_vdb (BaseVectorStorage)：方法执行所需输入参数。
-    
+        - entities_vdb (BaseVectorStorage)：实体向量库。
+        - relationships_vdb (BaseVectorStorage)：关系向量库。
+        - text_chunks_db (BaseKVStorage)：文本分块存储。
+        - query_param (QueryParam)：查询参数。
+        - global_config (dict[str, str])：全局配置。
+        - hashing_kv (BaseKVStorage | None)：缓存实例。
+        - system_prompt (str | None)：自定义提示词。
+        - chunks_vdb (BaseVectorStorage)：分块向量库。
+
     返回：
-        str | AsyncIterator[str]：方法执行结果；若为 None 表示主要通过副作用完成处理。
+        str | AsyncIterator[str]：最终回答字符串或流式迭代器。
     """
+    # 选择LLM模型函数
     if query_param.model_func:
         use_model_func = query_param.model_func
     else:
         use_model_func = global_config["llm_model_func"]
-        # Apply higher priority (5) to query relation LLM function
+        # 为查询相关的LLM函数应用更高优先级(5)
         use_model_func = partial(use_model_func, _priority=5)
-    # Handle cache
+    # 检查缓存
     args_hash = compute_args_hash(query_param.mode, query)
     cached_response, quantized, min_val, max_val = await handle_cache(
         hashing_kv, args_hash, query, query_param.mode, cache_type="query"
@@ -2573,11 +2646,13 @@ async def kg_two_step_query(
     if cached_response is not None:
         return cached_response
 
+    # 构造混合模式参数，用于并行执行图谱查询
     hybrid_param = QueryParam(
         mode='hybrid',
         chunk_top_k=query_param.chunk_top_k,
         enable_rerank=False
     )
+    # 创建知识图谱查询任务
     kg_task = kg_query(
         query,
         knowledge_graph_inst,
@@ -2590,11 +2665,13 @@ async def kg_two_step_query(
         system_prompt=system_prompt,
         chunks_vdb=chunks_vdb,
     )
+    # 构造朴素RAG参数
     naive_param = QueryParam(
         mode='naive',
         chunk_top_k=query_param.chunk_top_k,
         enable_rerank=False
     )
+    # 创建朴素向量查询任务
     naive_task = naive_query(
         query,
         chunks_vdb,
@@ -2604,18 +2681,22 @@ async def kg_two_step_query(
         hashing_kv=hashing_kv,
         system_prompt=system_prompt,
     )
+    # 并行执行两个任务，提升效率
     kg_response, naive_response = await asyncio.gather(kg_task, naive_task)
 
+    # 组装两阶段提示词，融合两个结果
     sys_prompt = PROMPTS["rag_two_step_response"].format(
         query=query,
         kg_answer=kg_response,
         image_answer=naive_response,
     )
+    # 调用LLM做最终融合生成
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
         stream=query_param.stream
     )
+    # 清洗结果
     if isinstance(response, str) and len(response) > len(sys_prompt):
         response = (
             response.replace(sys_prompt, "")
@@ -2627,8 +2708,9 @@ async def kg_two_step_query(
             .strip()
         )
 
+    # 写入缓存
     if hashing_kv.global_config.get("enable_llm_cache"):
-        # Save to cache
+        # 保存到缓存
         await save_to_cache(
             hashing_kv,
             CacheData(
@@ -2643,4 +2725,5 @@ async def kg_two_step_query(
             ),
         )
 
+    # 返回最终融合后的回答
     return response
