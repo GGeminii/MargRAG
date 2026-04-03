@@ -282,6 +282,179 @@ When handling information with timestamps:
 - Do not include information not provided by the inputs.
 """
 
+
+PROMPTS["mmkg_debate_support_agent"] = """---Role---
+You are the **Support Agent**.
+
+---Task---
+For the user's query, review the candidate triples in the evidence pool, identify the evidence that most likely supports the answer, and provide reasons for retention.
+
+---Input---
+- User query: {query}
+- Evidence pool (JSON):
+{evidence_pool}
+
+---Output Requirements---
+1. Output only JSON, no extra explanatory text.
+2. JSON structure:
+{{
+  "keep_ids": ["E1", "E3"],
+  "support_reasons": [
+    {{"id": "E1", "reason": "Explain why it supports the answer"}}
+  ],
+  "summary": "One-sentence summary of the supporting viewpoint"
+}}
+3. Only reference evidence_id that exists in the evidence pool.
+4. Do not fabricate evidence or introduce information outside the evidence pool.
+"""
+
+
+PROMPTS["mmkg_debate_rebuttal_agent"] = """---Role---
+You are the **Rebuttal Agent**.
+
+---Task---
+For the user's query, identify candidate triples in the evidence pool that are **relevant but do not support the answer** or **may mislead reasoning**.
+
+---Input---
+- User query: {query}
+- Evidence pool (JSON):
+{evidence_pool}
+
+---Output Requirements---
+1. Output only JSON, no extra explanatory text.
+2. JSON structure:
+{{
+  "reject_ids": ["E2", "E5"],
+  "rebuttal_reasons": [
+    {{"id": "E2", "reason": "Explain why it does not support or may mislead"}}
+  ],
+  "summary": "One-sentence summary of the rebuttal viewpoint"
+}}
+3. Only reference evidence_id that exists in the evidence pool.
+4. Do not fabricate evidence or introduce information outside the evidence pool.
+"""
+
+
+PROMPTS["mmkg_debate_ambiguity_agent"] = """---Role---
+You are the **Ambiguity Agent**.
+
+---Task---
+Check for modal ambiguity and semantic ambiguity in the evidence pool, such as unclear image regions, ambiguous table headers, unstable entity alignment, etc.
+
+---Input---
+- User query: {query}
+- Evidence pool (JSON):
+{evidence_pool}
+
+---Output Requirements---
+1. Output only JSON, no extra explanatory text.
+2. JSON structure:
+{{
+  "risky_ids": ["E4"],
+  "ambiguity_reasons": [
+    {{"id": "E4", "reason": "Source and impact of ambiguity"}}
+  ],
+  "summary": "One-sentence summary of ambiguity risks"
+}}
+3. Only reference evidence_id that exists in the evidence pool.
+4. Do not fabricate evidence or introduce information outside the evidence pool.
+"""
+
+
+PROMPTS["mmkg_debate_structure_agent"] = """---Role---
+You are the **Structure Verifier Agent**.
+
+---Task---
+Verify the structural credibility of candidate evidence, focusing on identifying:
+- Cross-modal entity mislinking;
+- Incorrect relation direction;
+- Irrelevant paths introduced by next-hop neighbors;
+- Fragile evidence due to insufficient local structural support.
+
+---Input---
+- User query: {query}
+- Evidence pool (JSON):
+{evidence_pool}
+
+---Output Requirements---
+1. Output only JSON, no extra explanatory text.
+2. JSON structure:
+{{
+  "suspect_ids": ["E6"],
+  "structure_reasons": [
+    {{"id": "E6", "reason": "Problems found in structure verification"}}
+  ],
+  "summary": "One-sentence summary of structure verification conclusion"
+}}
+3. Only reference evidence_id that exists in the evidence pool.
+4. Do not fabricate evidence or introduce information outside the evidence pool.
+"""
+
+
+PROMPTS["mmkg_debate_judge_agent"] = """---Role---
+You are the **Judge Agent**.
+
+---Task---
+Synthesize the opinions of the four agents to produce the final set of retained evidence for robust answer generation.
+
+---Input---
+- User query: {query}
+- Evidence pool (JSON):
+{evidence_pool}
+
+- Support Agent output:
+{support_view}
+
+- Rebuttal Agent output:
+{rebuttal_view}
+
+- Ambiguity Agent output:
+{ambiguity_view}
+
+- Structure Verifier Agent output:
+{structure_view}
+
+---Judgment Principles---
+1. Prioritize evidence that directly supports question solving and has no obvious structural risks;
+2. Be cautious with conflicting evidence; discard if necessary;
+3. Clarify sources of uncertainty; do not over‑infer.
+
+---Output Requirements---
+1. Output only JSON, no extra explanatory text.
+2. JSON structure:
+{{
+  "final_keep_ids": ["E1", "E3"],
+  "discard_ids": ["E2"],
+  "debate_summary": "Briefly summarize judgment logic and uncertainties"
+}}
+3. Only reference evidence_id that exists in the evidence pool.
+4. Do not fabricate evidence or introduce information outside the evidence pool.
+"""
+
+
+PROMPTS["mmkg_debate_rag_response"] = """---Role---
+You are a professional multimodal knowledge QA assistant. You must answer the user's query based on the knowledge graph, document chunks, page images, and the **Multi-Agent Debate Judgment Result**.
+
+---Goal---
+Generate a complete, rigorous, and traceable answer. Prioritize trusted triples retained in the **Debate Results (DR)**; if uncertainty remains, clearly state the ambiguous points. Do not fabricate information.
+
+---Conversation History---
+{history}
+
+---Knowledge Graph, Document Chunks, Page Images, and Debate Results---
+{context_data}
+
+---Response Rules---
+- Target format and length: {response_type}
+- Respond in the same language as the user's query.
+- Provide the conclusion first, then key evidence and reasoning process.
+- Reasoning should reflect: supporting evidence, rebuttal risks, ambiguity handling, structure verification conclusions (if applicable).
+- If evidence is insufficient, clearly state "Insufficient evidence" and identify missing information.
+- At the end, provide a **References** section listing up to 5 most important sources in the format: [KG/DC/PI/DR] path_or_id
+- Additional user prompt: {user_prompt}
+
+Response:"""
+
 # DEFAULT_USER_PROMPT (x -> na)
 
 # entity_continue_extraction (v)

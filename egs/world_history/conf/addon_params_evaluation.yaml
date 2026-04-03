@@ -1,0 +1,49 @@
+evaluation:
+  # 评估模式：
+  # - global_pairwise：无标准答案的两两比较评估
+  # - local_correctness：有标准答案的正确性评估
+  mode: global_pairwise
+
+  # 评估器模型（可按实验需要切换）
+  eval_model: gpt-5.4-mini
+
+  # 评估输出最大 token，适当放大可减少截断风险
+  eval_max_tokens: 1200
+
+  # 评估并发数（请结合 API 配额调整）
+  concurrency: 4
+
+  # 单题评估失败重试次数
+  max_retries: 3
+
+  # 重试基础间隔秒数（指数退避）
+  retry_delay: 1.0
+
+  # -----------------------------
+  # 方法1（全局 pairwise）输入输出
+  # -----------------------------
+  # Answer 1（默认我方：mmkg_debate）
+  ours_result_file: ./exp/World_History_Volume_1/results/results_mmkg_debate.json
+  # Answer 2（默认 baseline：mix_two_step）
+  baseline_result_file: ./exp/World_History_Volume_1/results/results.json
+  # 方法1评估结果输出
+  global_output_file: ./exp/World_History_Volume_1/evaluation/global_pairwise_eval.json
+
+  # -----------------------------
+  # 方法2（本地 correctness）输入输出
+  # -----------------------------
+  # 待评估模型结果文件（question + answer）
+  local_result_file: ./exp/World_History_Volume_1/results/results_mmkg_debate.json
+  # 标准答案文件（需包含 index + answer，建议结构与 results 对齐）
+  local_gt_file: ./data/local_qa_gt.json
+  # 方法2评估结果输出
+  local_output_file: ./exp/World_History_Volume_1/evaluation/local_correctness_eval.json
+
+  # -----------------------------
+  # 可视化输出配置
+  # -----------------------------
+  # 图表输出目录
+  viz_output_dir: ./exp/World_History_Volume_1/evaluation/figures
+  # 图表统计摘要 JSON 输出
+  viz_summary_file: ./exp/World_History_Volume_1/evaluation/figures/eval_visual_summary.json
+

@@ -2429,6 +2429,802 @@ async def naive_query(
     return response
 
 
+def _extract_context_json_block(context: str, section_name: str) -> list | dict:
+    """
+    功能说明：
+        从上下文字符串中提取指定 section 的 JSON 代码块。
+
+    参数：
+        - context (str)：完整的上下文字符串。
+        - section_name (str)：section 标题（如 Entities(KG)）。
+
+    返回：
+        list | dict：解析后的 JSON；解析失败返回空列表。
+    """
+    # 通过正则定位形如 “-----Section----- + ```json ... ```” 的片段
+    pattern = rf"-----{re.escape(section_name)}-----\s*```json\s*(.*?)\s*```"
+    match = re.search(pattern, context, re.DOTALL)
+    if not match:
+        return []
+    try:
+        return json.loads(match.group(1))
+    except Exception:
+        # 解析失败时返回空列表，保证主流程不崩溃
+        return []
+
+
+def _safe_parse_json_from_llm_text(text: str) -> dict | list | None:
+    """
+    功能说明：
+        尝试从 LLM 返回文本中安全解析第一段 JSON（对象或数组）。
+
+    参数：
+        - text (str)：LLM 原始输出文本。
+
+    返回：
+        dict | list | None：成功返回 JSON 对象；失败返回 None。
+    """
+    # 先移除 think 标签，减少噪声干扰
+    cleaned = remove_think_tags(text or "")
+
+    # 优先解析 ```json ... ``` 包裹的内容
+    fenced = re.search(r"```json\s*(.*?)\s*```", cleaned, re.DOTALL)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except Exception:
+            pass
+
+    # 回退：在整段文本中查找第一个可解析 JSON 片段
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(cleaned):
+        if ch not in "{[":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(cleaned[idx:])
+            if isinstance(obj, (dict, list)):
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+def _normalize_relation_candidates(relations_context: list[dict]) -> list[dict]:
+    """
+    功能说明：
+        将关系上下文标准化为“候选三元组”格式，统一字段并补充证据ID。
+
+    参数：
+        - relations_context (list[dict])：关系上下文列表。
+
+    返回：
+        list[dict]：标准化后的候选三元组列表。
+    """
+    candidates = []
+    for idx, rel in enumerate(relations_context, start=1):
+        # 兼容不同上下文字段命名（entity1/entity2 或 source_entity/target_entity）
+        head = rel.get("entity1") or rel.get("source_entity") or ""
+        tail = rel.get("entity2") or rel.get("target_entity") or ""
+        if not head or not tail:
+            continue
+
+        candidates.append(
+            {
+                "evidence_id": f"E{idx}",
+                "head": head,
+                "relation": rel.get("description", ""),
+                "tail": tail,
+                "created_at": rel.get("created_at", "UNKNOWN"),
+                "file_path": rel.get("file_path", "unknown_source"),
+                # 先占位，后续再计算结构支撑特征
+                "n_path": 0,
+                "n_common": 0,
+                "struct_sup_raw": 0.0,
+                "struct_sup_norm": 0.0,
+                "trigger_debate": False,
+            }
+        )
+    return candidates
+
+
+async def _ensure_neighbors_in_cache(
+    node_ids: list[str],
+    knowledge_graph_inst: BaseGraphStorage,
+    neighbor_cache: dict[str, set[str]],
+) -> None:
+    """
+    功能说明：
+        批量获取节点邻居并写入缓存，避免重复访问图存储。
+
+    参数：
+        - node_ids (list[str])：待查询节点列表。
+        - knowledge_graph_inst (BaseGraphStorage)：图存储实例。
+        - neighbor_cache (dict[str, set[str]])：邻居缓存字典。
+
+    返回：
+        None：通过副作用更新缓存。
+    """
+    # 只查询缓存里缺失的节点，降低图数据库压力
+    missing = [nid for nid in node_ids if nid and nid not in neighbor_cache]
+    if not missing:
+        return
+
+    # 批量读取节点边集合（比逐条查询更高效）
+    batch_edges = await knowledge_graph_inst.get_nodes_edges_batch(missing)
+    for nid in missing:
+        edges = batch_edges.get(nid, []) or []
+        neighbors = set()
+
+        # 将边列表转换为“与 nid 相连的邻居节点集合”
+        for edge in edges:
+            if not isinstance(edge, (list, tuple)) or len(edge) < 2:
+                continue
+            src, tgt = edge[0], edge[1]
+            if src == nid and tgt:
+                neighbors.add(tgt)
+            elif tgt == nid and src:
+                neighbors.add(src)
+            else:
+                # 极端情况下若边不含 nid，保守加入两个端点（并排除自身）
+                if src and src != nid:
+                    neighbors.add(src)
+                if tgt and tgt != nid:
+                    neighbors.add(tgt)
+
+        neighbor_cache[nid] = neighbors
+
+
+def _count_length_3_paths(h: str, t: str, adjacency: dict[str, set[str]]) -> int:
+    """
+    功能说明：
+        在局部子图中统计从 h 到 t 的长度为 3 的简单路径数量（h-x-y-t）。
+
+    参数：
+        - h (str)：头实体。
+        - t (str)：尾实体。
+        - adjacency (dict[str, set[str]])：局部子图邻接表。
+
+    返回：
+        int：长度为 3 的简单路径数。
+    """
+    count = 0
+    h_neighbors = adjacency.get(h, set()) - {h, t}
+    t_neighbors = adjacency.get(t, set()) - {h, t}
+
+    # 枚举中间两跳节点 x、y，要求 x!=y 且存在 x-y 连边
+    for x in h_neighbors:
+        x_neighbors = adjacency.get(x, set())
+        for y in t_neighbors:
+            if x == y:
+                continue
+            if y in x_neighbors and y not in {h, t}:
+                count += 1
+    return count
+
+
+async def _compute_structural_support(
+    candidates: list[dict],
+    knowledge_graph_inst: BaseGraphStorage,
+    *,
+    w1: float,
+    w2: float,
+    tau: float,
+    max_local_nodes: int = 160,
+) -> list[dict]:
+    """
+    功能说明：
+        计算候选三元组结构支撑分数 StructSup，并标记是否触发辩论。
+
+    参数：
+        - candidates (list[dict])：候选三元组列表。
+        - knowledge_graph_inst (BaseGraphStorage)：图存储实例。
+        - w1 (float)：路径支撑项权重。
+        - w2 (float)：共同邻居项权重。
+        - tau (float)：归一化触发阈值（低于阈值触发辩论）。
+        - max_local_nodes (int)：局部子图最大节点数，防止过大开销。
+
+    返回：
+        list[dict]：补充结构分数字段后的候选三元组列表。
+    """
+    if not candidates:
+        return candidates
+
+    # 邻居缓存：node -> set(neighbors)
+    neighbor_cache: dict[str, set[str]] = {}
+    # pair 缓存：同一 (h,t) 复用结构特征，避免重复计算
+    pair_cache: dict[tuple[str, str], tuple[int, int, float]] = {}
+
+    # 先批量预热端点邻居，减少后续 round trip
+    endpoint_nodes = list(
+        {
+            node
+            for c in candidates
+            for node in (c.get("head", ""), c.get("tail", ""))
+            if node
+        }
+    )
+    await _ensure_neighbors_in_cache(endpoint_nodes, knowledge_graph_inst, neighbor_cache)
+
+    # 逐条计算结构支撑特征
+    for c in candidates:
+        h, t = c["head"], c["tail"]
+        pair = (h, t)
+        if pair in pair_cache:
+            n_path, n_common, raw = pair_cache[pair]
+            c["n_path"], c["n_common"], c["struct_sup_raw"] = n_path, n_common, raw
+            continue
+
+        # 获取 h、t 的一跳邻居
+        h_neighbors = neighbor_cache.get(h, set())
+        t_neighbors = neighbor_cache.get(t, set())
+
+        # 构建局部子图节点集合，并进行节点数上限保护
+        local_nodes = {h, t} | h_neighbors | t_neighbors
+        if len(local_nodes) > max_local_nodes:
+            # 过大时仅保留前 max_local_nodes 个节点，避免极端图导致超时
+            local_nodes = set(list(local_nodes)[:max_local_nodes])
+            local_nodes.add(h)
+            local_nodes.add(t)
+
+        # 计算长度 2/3 路径需要 local_nodes 内节点邻居信息
+        await _ensure_neighbors_in_cache(list(local_nodes), knowledge_graph_inst, neighbor_cache)
+        adjacency = {
+            node: (neighbor_cache.get(node, set()) & local_nodes)
+            for node in local_nodes
+        }
+
+        # 路径支撑：长度 2 与长度 3 简单路径总数
+        n_len2 = len((adjacency.get(h, set()) - {t}) & (adjacency.get(t, set()) - {h}))
+        n_len3 = _count_length_3_paths(h, t, adjacency)
+        n_path = n_len2 + n_len3
+
+        # 共同邻居数量
+        n_common = len((adjacency.get(h, set()) - {t}) & (adjacency.get(t, set()) - {h}))
+        raw = float(w1 * n_path + w2 * n_common)
+
+        c["n_path"] = n_path
+        c["n_common"] = n_common
+        c["struct_sup_raw"] = raw
+        pair_cache[pair] = (n_path, n_common, raw)
+
+    # 对 StructSup 做 min-max 归一化
+    raw_scores = [float(c["struct_sup_raw"]) for c in candidates]
+    min_s, max_s = min(raw_scores), max(raw_scores)
+
+    for c in candidates:
+        raw = float(c["struct_sup_raw"])
+        if max_s > min_s:
+            norm = (raw - min_s) / (max_s - min_s)
+        else:
+            # 所有候选分数相同：若 >0 视为稳定证据，否则视为弱证据
+            norm = 1.0 if raw > 0 else 0.0
+        c["struct_sup_norm"] = float(round(norm, 6))
+        c["trigger_debate"] = norm < tau
+
+    return candidates
+
+
+def _extract_evidence_ids_from_text(text: str) -> list[str]:
+    """
+    功能说明：
+        从文本中提取形如 E1 / E23 的证据ID列表。
+
+    参数：
+        - text (str)：任意文本。
+
+    返回：
+        list[str]：去重后的证据ID列表。
+    """
+    if not text:
+        return []
+    # 统一转大写，兼容 e1 / E1
+    ids = re.findall(r"\bE\d+\b", text.upper())
+    return list(dict.fromkeys(ids))
+
+
+def _normalize_id_list(raw_value: Any, valid_ids: set[str]) -> list[str]:
+    """
+    功能说明：
+        归一化 agent 输出中的证据 ID 列表，并过滤非法 ID。
+
+    参数：
+        - raw_value (Any)：agent 输出字段（可能是 list / str / 其他）。
+        - valid_ids (set[str])：有效证据 ID 集合。
+
+    返回：
+        list[str]：合法且去重后的 ID 列表。
+    """
+    if isinstance(raw_value, list):
+        norm = []
+        for item in raw_value:
+            if item is None:
+                continue
+            eid = str(item).strip().upper()
+            if eid in valid_ids:
+                norm.append(eid)
+        return list(dict.fromkeys(norm))
+
+    if isinstance(raw_value, str):
+        return [eid for eid in _extract_evidence_ids_from_text(raw_value) if eid in valid_ids]
+
+    return []
+
+
+async def _run_single_debate_agent(
+    *,
+    use_model_func: callable,
+    query: str,
+    prompt_text: str,
+    page_imgs: list[str],
+) -> tuple[dict | list | None, str]:
+    """
+    功能说明：
+        执行单个辩论智能体并解析其 JSON 输出。
+
+    参数：
+        - use_model_func (callable)：LLM 调用函数。
+        - query (str)：用户问题。
+        - prompt_text (str)：该智能体的系统提示词。
+        - page_imgs (list[str])：可选图片输入。
+
+    返回：
+        tuple[dict | list | None, str]：结构化结果 + 原始文本。
+    """
+    # 内部辩论阶段固定关闭流式，保证可解析 JSON
+    raw = await use_model_func(
+        query,
+        system_prompt=prompt_text,
+        input_images=page_imgs,
+        stream=False,
+    )
+    if isinstance(raw, str):
+        parsed = _safe_parse_json_from_llm_text(raw)
+        return parsed, raw
+    return None, str(raw)
+
+
+def _build_debate_answer_context(
+    *,
+    base_context: str,
+    final_triples: list[dict],
+    debated_triples: list[dict],
+    judge_result: dict,
+    agent_views: dict[str, Any],
+) -> str:
+    """
+    功能说明：
+        构建用于最终回答生成的“辩论增强上下文”字符串。
+
+    参数：
+        - base_context (str)：原始 KG/DC/PI 上下文。
+        - final_triples (list[dict])：裁决后保留的可信三元组。
+        - debated_triples (list[dict])：触发辩论的候选三元组。
+        - judge_result (dict)：裁决智能体结果。
+        - agent_views (dict[str, Any])：各智能体观点摘要。
+
+    返回：
+        str：拼接后的增强上下文。
+    """
+    debate_bundle = {
+        "final_triples": final_triples,
+        "debated_triples": debated_triples,
+        "judge_result": judge_result,
+        "agent_views": agent_views,
+    }
+    debate_json = json.dumps(debate_bundle, ensure_ascii=False, indent=2)
+    return (
+        f"{base_context}\n"
+        "-----Debate Results (DR)-----\n"
+        "```json\n"
+        f"{debate_json}\n"
+        "```\n"
+    )
+
+
+async def kg_debate_query(
+    query: str,
+    knowledge_graph_inst: BaseGraphStorage,
+    entities_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage,
+    query_param: QueryParam,
+    global_config: dict[str, str],
+    hashing_kv: BaseKVStorage | None = None,
+    system_prompt: str | None = None,
+    chunks_vdb: BaseVectorStorage = None,
+) -> str | AsyncIterator[str]:
+    """
+    功能说明：
+        执行“结构触发 + 多智能体辩论 + 裁决生成”的检索优化问答流程。
+        核心步骤：
+        1) 先按 KG-RAG 拿到初始上下文；
+        2) 计算 StructSup，筛出低结构支撑证据；
+        3) 对低支撑证据执行多智能体辩论并裁决；
+        4) 使用“可信子图 + 辩论摘要”生成最终答案。
+
+    参数：
+        - query (str)：用户查询。
+        - knowledge_graph_inst (BaseGraphStorage)：图存储实例。
+        - entities_vdb (BaseVectorStorage)：实体向量库。
+        - relationships_vdb (BaseVectorStorage)：关系向量库。
+        - text_chunks_db (BaseKVStorage)：文本分块存储。
+        - query_param (QueryParam)：查询参数。
+        - global_config (dict[str, str])：全局配置。
+        - hashing_kv (BaseKVStorage | None)：缓存存储。
+        - system_prompt (str | None)：可选自定义最终回答提示词。
+        - chunks_vdb (BaseVectorStorage)：文本块向量库。
+
+    返回：
+        str | AsyncIterator[str]：最终回答或流式迭代器。
+    """
+    # 选择用于查询阶段的模型函数（优先 query_param 覆盖）
+    if query_param.model_func:
+        use_model_func = query_param.model_func
+    else:
+        use_model_func = global_config["llm_model_func"]
+        use_model_func = partial(use_model_func, _priority=5)
+
+    # 先查缓存，命中则直接返回
+    args_hash = compute_args_hash(query_param.mode, query)
+    cached_response, quantized, min_val, max_val = await handle_cache(
+        hashing_kv, args_hash, query, query_param.mode, cache_type="query"
+    )
+    if cached_response is not None:
+        return cached_response
+
+    # 关键词抽取逻辑复用 kg_query，保证行为一致
+    hl_keywords, ll_keywords = await get_keywords_from_query(
+        query, query_param, global_config, hashing_kv
+    )
+    if hl_keywords == [] and ll_keywords == []:
+        logger.warning("low_level_keywords and high_level_keywords is empty")
+        return PROMPTS["fail_response"]
+
+    # 为结构辩论模式做关键词缺失时的降级
+    if ll_keywords == [] and query_param.mode in ["hybrid", "mmkg_debate"]:
+        logger.warning(
+            "low_level_keywords is empty, switching from %s mode to global mode",
+            query_param.mode,
+        )
+        query_param.mode = "global"
+    if hl_keywords == [] and query_param.mode in ["global", "hybrid", "mmkg_debate"]:
+        logger.warning(
+            "high_level_keywords is empty, switching from %s mode to local mode",
+            query_param.mode,
+        )
+        query_param.mode = "local"
+
+    ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
+    hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
+
+    # 为上下文构建指定底层检索模式（mmkg_debate 走 hybrid 取图谱上下文）
+    raw_mode = query_param.mode
+    if raw_mode == "mmkg_debate":
+        query_param.mode = "hybrid"
+
+    # 构建原始 KG+DC+PI 上下文
+    context, page_imgs = await _build_query_context_with_image(
+        query,
+        ll_keywords_str,
+        hl_keywords_str,
+        knowledge_graph_inst,
+        entities_vdb,
+        relationships_vdb,
+        text_chunks_db,
+        query_param,
+        chunks_vdb,
+    )
+
+    # 恢复原模式，避免影响调用方后续逻辑
+    query_param.mode = raw_mode
+
+    # 上下文不可用直接失败返回
+    if context is None:
+        return PROMPTS["fail_response"]
+
+    # 从上下文中解析结构化实体、关系、文本块
+    entities_context = _extract_context_json_block(context, "Entities(KG)")
+    relations_context = _extract_context_json_block(context, "Relationships(KG)")
+    chunks_context = _extract_context_json_block(context, "Document Chunks(DC)")
+
+    # 统一为 list，防止解析异常影响后续处理
+    entities_context = entities_context if isinstance(entities_context, list) else []
+    relations_context = relations_context if isinstance(relations_context, list) else []
+    chunks_context = chunks_context if isinstance(chunks_context, list) else []
+
+    # 候选三元组标准化
+    candidates = _normalize_relation_candidates(relations_context)
+    if not candidates:
+        # 如果没有关系候选，回退到普通 kg_query，保证可用性
+        return await kg_query(
+            query=query,
+            knowledge_graph_inst=knowledge_graph_inst,
+            entities_vdb=entities_vdb,
+            relationships_vdb=relationships_vdb,
+            text_chunks_db=text_chunks_db,
+            query_param=query_param,
+            global_config=global_config,
+            hashing_kv=hashing_kv,
+            system_prompt=system_prompt,
+            chunks_vdb=chunks_vdb,
+        )
+
+    # 读取结构触发参数（可在 addon_params 中覆盖）
+    addon = global_config.get("addon_params", {}) or {}
+    w1 = float(addon.get("debate_structsup_w1", 0.6))
+    w2 = float(addon.get("debate_structsup_w2", 0.4))
+    tau = float(addon.get("debate_trigger_tau", 0.35))
+    max_local_nodes = int(addon.get("debate_struct_max_nodes", 160))
+    max_debate_triples = int(addon.get("debate_max_triples", 12))
+
+    # 计算结构支撑分数并标注触发条件
+    candidates = await _compute_structural_support(
+        candidates,
+        knowledge_graph_inst,
+        w1=w1,
+        w2=w2,
+        tau=tau,
+        max_local_nodes=max_local_nodes,
+    )
+
+    # 按是否触发辩论分桶
+    triggered = [c for c in candidates if c.get("trigger_debate", False)]
+    trusted = [c for c in candidates if not c.get("trigger_debate", False)]
+    # 触发证据按结构分从低到高排序，优先处理最脆弱证据
+    triggered = sorted(triggered, key=lambda x: x.get("struct_sup_norm", 0.0))
+    if len(triggered) > max_debate_triples:
+        triggered = triggered[:max_debate_triples]
+
+    # 构建辩论证据池，包含触发候选与可信参考证据
+    debate_payload = {
+        "query": query,
+        "trigger_rule": {
+            "formula": "StructSup(e)=w1*N_path(h,t)+w2*N_common(h,t)",
+            "w1": w1,
+            "w2": w2,
+            "tau": tau,
+            "trigger_condition": "struct_sup_norm < tau",
+        },
+        "triggered_triples": triggered,
+        "trusted_reference_triples": trusted[: max(6, max_debate_triples // 2)],
+        "entities": entities_context[:20],
+        "document_chunks": chunks_context[:12],
+        "page_images": page_imgs[:10],
+    }
+    debate_payload_json = json.dumps(debate_payload, ensure_ascii=False, indent=2)
+
+    # 初始化各智能体产物（若未触发辩论，则保持空结果）
+    support_view: dict | list | None = None
+    rebuttal_view: dict | list | None = None
+    ambiguity_view: dict | list | None = None
+    structure_view: dict | list | None = None
+    judge_view: dict | list | None = None
+
+    support_raw = rebuttal_raw = ambiguity_raw = structure_raw = judge_raw = ""
+
+    # 仅在存在触发证据时执行多智能体辩论
+    if triggered:
+        # 支持智能体：从触发证据中挑选可保留证据
+        support_prompt = PROMPTS["mmkg_debate_support_agent"].format(
+            query=query,
+            evidence_pool=debate_payload_json,
+        )
+        support_view, support_raw = await _run_single_debate_agent(
+            use_model_func=use_model_func,
+            query=query,
+            prompt_text=support_prompt,
+            page_imgs=page_imgs,
+        )
+
+        # 反驳智能体：指出不支持回答或潜在误导证据
+        rebuttal_prompt = PROMPTS["mmkg_debate_rebuttal_agent"].format(
+            query=query,
+            evidence_pool=debate_payload_json,
+        )
+        rebuttal_view, rebuttal_raw = await _run_single_debate_agent(
+            use_model_func=use_model_func,
+            query=query,
+            prompt_text=rebuttal_prompt,
+            page_imgs=page_imgs,
+        )
+
+        # 歧义智能体：识别模态歧义与不稳定对齐
+        ambiguity_prompt = PROMPTS["mmkg_debate_ambiguity_agent"].format(
+            query=query,
+            evidence_pool=debate_payload_json,
+        )
+        ambiguity_view, ambiguity_raw = await _run_single_debate_agent(
+            use_model_func=use_model_func,
+            query=query,
+            prompt_text=ambiguity_prompt,
+            page_imgs=page_imgs,
+        )
+
+        # 结构核验智能体：检查图边可信度与路径污染
+        structure_prompt = PROMPTS["mmkg_debate_structure_agent"].format(
+            query=query,
+            evidence_pool=debate_payload_json,
+        )
+        structure_view, structure_raw = await _run_single_debate_agent(
+            use_model_func=use_model_func,
+            query=query,
+            prompt_text=structure_prompt,
+            page_imgs=page_imgs,
+        )
+
+        # 裁决智能体：综合四方观点得到最终保留证据
+        judge_prompt = PROMPTS["mmkg_debate_judge_agent"].format(
+            query=query,
+            evidence_pool=debate_payload_json,
+            support_view=json.dumps(support_view, ensure_ascii=False, indent=2)
+            if support_view is not None
+            else support_raw,
+            rebuttal_view=json.dumps(rebuttal_view, ensure_ascii=False, indent=2)
+            if rebuttal_view is not None
+            else rebuttal_raw,
+            ambiguity_view=json.dumps(ambiguity_view, ensure_ascii=False, indent=2)
+            if ambiguity_view is not None
+            else ambiguity_raw,
+            structure_view=json.dumps(structure_view, ensure_ascii=False, indent=2)
+            if structure_view is not None
+            else structure_raw,
+        )
+        judge_view, judge_raw = await _run_single_debate_agent(
+            use_model_func=use_model_func,
+            query=query,
+            prompt_text=judge_prompt,
+            page_imgs=page_imgs,
+        )
+
+    # 解析裁决保留列表；若解析失败则走投票回退
+    triggered_ids = {item["evidence_id"] for item in triggered}
+    keep_ids: list[str] = []
+    discard_ids: list[str] = []
+    debate_summary = "未触发辩论，直接采用结构高支撑证据。"
+
+    if isinstance(judge_view, dict):
+        keep_ids = _normalize_id_list(
+            judge_view.get("final_keep_ids", judge_view.get("keep_ids", [])),
+            triggered_ids,
+        )
+        discard_ids = _normalize_id_list(
+            judge_view.get("discard_ids", judge_view.get("reject_ids", [])),
+            triggered_ids,
+        )
+        debate_summary = str(
+            judge_view.get("debate_summary", "已完成辩论裁决。")
+        ).strip()
+
+    # 回退策略：用四个角色的“投票分数”决定是否保留触发证据
+    if triggered and not keep_ids:
+        vote_score = {eid: 0 for eid in triggered_ids}
+
+        def _add_votes(view_obj: Any, positive_keys: list[str], negative_keys: list[str]):
+            if not isinstance(view_obj, dict):
+                return
+            for k in positive_keys:
+                for eid in _normalize_id_list(view_obj.get(k, []), triggered_ids):
+                    vote_score[eid] += 1
+            for k in negative_keys:
+                for eid in _normalize_id_list(view_obj.get(k, []), triggered_ids):
+                    vote_score[eid] -= 1
+
+        # 支持视角投正票；其余三个视角（反驳/歧义/结构）投负票
+        _add_votes(support_view, ["keep_ids", "support_ids", "selected_ids"], [])
+        _add_votes(rebuttal_view, [], ["reject_ids", "discard_ids", "risky_ids"])
+        _add_votes(ambiguity_view, [], ["risky_ids", "ambiguous_ids", "reject_ids"])
+        _add_votes(structure_view, [], ["suspect_ids", "reject_ids", "risky_ids"])
+
+        keep_ids = [eid for eid, sc in vote_score.items() if sc > 0]
+        if not debate_summary or debate_summary == "已完成辩论裁决。":
+            debate_summary = "裁决解析失败，已采用多角色投票回退策略。"
+
+    # 组装“最终可信三元组”：高支撑证据 + 裁决保留证据
+    triggered_by_id = {item["evidence_id"]: item for item in triggered}
+    final_triples = list(trusted)
+    final_triples.extend([triggered_by_id[eid] for eid in keep_ids if eid in triggered_by_id])
+
+    # 兜底：如果最终为空，至少保留一条结构分最高证据保证回答可进行
+    if not final_triples and candidates:
+        best = max(candidates, key=lambda x: x.get("struct_sup_norm", 0.0))
+        final_triples = [best]
+
+    # 统一裁决结果对象，便于注入最终回答上下文
+    judge_result = {
+        "final_keep_ids": keep_ids,
+        "discard_ids": discard_ids,
+        "debate_summary": debate_summary,
+        "triggered_count": len(triggered),
+        "trusted_count": len(trusted),
+        "final_count": len(final_triples),
+    }
+    agent_views = {
+        "support_agent": support_view if support_view is not None else support_raw,
+        "rebuttal_agent": rebuttal_view if rebuttal_view is not None else rebuttal_raw,
+        "ambiguity_agent": ambiguity_view if ambiguity_view is not None else ambiguity_raw,
+        "structure_agent": structure_view if structure_view is not None else structure_raw,
+        "judge_agent": judge_view if judge_view is not None else judge_raw,
+    }
+
+    # 构建“辩论增强上下文”
+    debate_context = _build_debate_answer_context(
+        base_context=context,
+        final_triples=final_triples,
+        debated_triples=triggered,
+        judge_result=judge_result,
+        agent_views=agent_views,
+    )
+
+    # 若只要上下文，直接返回
+    if query_param.only_need_context:
+        return debate_context
+
+    # 对话历史拼接，保持与既有模式一致
+    history_context = ""
+    if query_param.conversation_history:
+        history_context = get_conversation_turns(
+            query_param.conversation_history, query_param.history_turns
+        )
+
+    # 构建最终回答提示词（可被外部 system_prompt 覆盖）
+    user_prompt = (
+        query_param.user_prompt
+        if query_param.user_prompt
+        else PROMPTS["DEFAULT_USER_PROMPT"]
+    )
+    sys_prompt_temp = (
+        system_prompt if system_prompt else PROMPTS["mmkg_debate_rag_response"]
+    )
+    sys_prompt = sys_prompt_temp.format(
+        history=history_context,
+        context_data=debate_context,
+        response_type=query_param.response_type,
+        user_prompt=user_prompt,
+    )
+
+    # 若只要提示词，直接返回
+    if query_param.only_need_prompt:
+        return sys_prompt
+
+    # 调用 LLM 生成最终稳健答案
+    response = await use_model_func(
+        query,
+        system_prompt=sys_prompt,
+        stream=query_param.stream,
+        input_images=page_imgs,
+    )
+
+    # 文本清洗：移除可能回显的系统提示与角色标签
+    if isinstance(response, str) and len(response) > len(sys_prompt):
+        response = (
+            response.replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+
+    # 写入缓存（若启用）
+    if hashing_kv and hashing_kv.global_config.get("enable_llm_cache"):
+        await save_to_cache(
+            hashing_kv,
+            CacheData(
+                args_hash=args_hash,
+                content=response,
+                prompt=query,
+                quantized=quantized,
+                min_val=min_val,
+                max_val=max_val,
+                mode=query_param.mode,
+                cache_type="query",
+            ),
+        )
+
+    return response
+
+
 async def kg_query(
         query: str,
         knowledge_graph_inst: BaseGraphStorage,

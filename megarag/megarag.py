@@ -68,6 +68,7 @@ from megarag.operate import (
     kg_query,
     naive_query,
     kg_two_step_query,
+    kg_debate_query,
 )
 
 from megarag.utils import plot_waterfall_from_jsonl
@@ -1496,6 +1497,21 @@ class MegaRAG(LightRAG):
             elif param.mode == "mix_two_step":
                 async with stage("kg_two_step_query"):
                     response = await kg_two_step_query(
+                        query.strip(),
+                        self.chunk_entity_relation_graph,
+                        self.entities_vdb,
+                        self.relationships_vdb,
+                        self.text_chunks,
+                        param,
+                        global_config,
+                        hashing_kv=self.llm_response_cache,
+                        system_prompt=system_prompt,
+                        chunks_vdb=self.chunks_vdb,
+                    )
+            # 结构触发 + 多智能体辩论 + 裁决 的检索增强模式
+            elif param.mode == "mmkg_debate":
+                async with stage("kg_debate_query"):
+                    response = await kg_debate_query(
                         query.strip(),
                         self.chunk_entity_relation_graph,
                         self.entities_vdb,

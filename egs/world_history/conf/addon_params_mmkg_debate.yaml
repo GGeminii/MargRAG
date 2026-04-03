@@ -1,0 +1,46 @@
+# 提示词示例数量
+example_number: 1
+
+# 输出语言
+language: English
+
+# 实体类型定义
+entity_types:
+  - time_period
+  - geographical_location
+  - civilization_or_empire
+  - historical_concept_or_event
+  - historical_figure
+  - cultural_or_religious_movement
+  - source_or_artifact
+  - textbook_structure
+
+# 构图阶段相关参数
+insert_batch_size: 16
+entity_extract_max_gleaning: 0
+entity_refine_max_times: 1
+
+# 精修子图配置
+refine_subgraph_top_k: 120
+refine_subgraph_max_token_for_global_context: 8000
+refine_subgraph_max_token_for_local_context: 8000
+refine_subgraph_max_token_for_text_unit: 8000
+
+# 查询 chunk top-k
+chunk_top_k: 6
+
+# 嵌入并发（请按显存调整）
+embed_parallel_limit: 12
+
+# 结构触发 + 多智能体辩论
+# StructSup(e)=w1*N_path + w2*N_common 中的路径项权重
+debate_structsup_w1: 0.6
+# StructSup(e)=w1*N_path + w2*N_common 中的共同邻居项权重
+debate_structsup_w2: 0.4
+# 触发阈值：归一化结构分 < tau 的候选将进入辩论
+debate_trigger_tau: 0.35
+# 局部子图节点上限（防止路径统计过慢）
+debate_struct_max_nodes: 160
+# 单次最多送入辩论的候选三元组数量
+debate_max_triples: 12
+
